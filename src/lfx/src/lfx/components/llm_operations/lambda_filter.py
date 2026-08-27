@@ -17,6 +17,8 @@ from lfx.schema.message import Message
 from lfx.schema.token_usage import extract_usage_from_message
 from lfx.utils.constants import MESSAGE_SENDER_AI
 from lfx.utils.python_repl_security import safe_builtins, validate_code_safety
+from lfx.utils.sandbox import SandboxExecutionError, is_sandbox_enabled, run_code_in_sandbox, session_for
+from lfx.workflow.end_user_identity import end_user_id_from_graph
 
 TEXT_TRANSFORM_PROMPT = (
     "Given this text, create a Python lambda function that transforms it "
@@ -38,6 +40,32 @@ DATA_TRANSFORM_PROMPT = (
     "Return ONLY the lambda function and nothing else. No need for ```python or whatever.\n"
     "Just a string starting with lambda."
 )
+
+# Guest-side driver for the sandboxed path. The input arrives as a JSON string
+# literal that the guest parses, rather than as spliced-in Python source, so no
+# value in the data can terminate the literal and become code. The lambda itself
+# is spliced in as source because executing it is the whole point of the VM.
+SANDBOX_LAMBDA_SCRIPT = """\
+import contextlib
+import io
+import json
+
+_data = json.loads({data_literal})
+
+# Incidental stdout from the lambda (``lambda x: print(x)`` is a valid
+# expression) must not corrupt the JSON payload this script prints as its result.
+_buffer = io.StringIO()
+with contextlib.redirect_stdout(_buffer):
+    _result = ({lambda_text})(_data)
+
+try:
+    _payload = json.dumps(_result)
+except TypeError as exc:
+    _msg = "Smart Transform sandbox: the lambda returned a value that is not JSON-serializable: " + str(exc)
+    raise TypeError(_msg) from None
+
+print(_payload)
+"""
 
 
 class LambdaFilterComponent(Component):
@@ -226,8 +254,12 @@ class LambdaFilterComponent(Component):
             dump_structure=dump_structure, data_sample=data_sample, instruction=self.filter_instruction
         )
 
-    def _parse_lambda_from_response(self, response_text: str) -> Callable[[Any], Any]:
-        """Extract and validate lambda function from LLM response."""
+    def _extract_lambda_text(self, response_text: str) -> str:
+        """Pull the lambda source out of the LLM response and check its shape.
+
+        Shared by both execution paths: the format check is input validation,
+        not a host-process protection, so it applies in the sandbox too.
+        """
         lambda_match = re.search(r"lambda\s+\w+\s*:.*?(?=\n|$)", response_text)
         if not lambda_match:
             msg = f"Could not find lambda in response: {response_text}"
@@ -239,6 +271,12 @@ class LambdaFilterComponent(Component):
         if not self._validate_lambda(lambda_text):
             msg = f"Invalid lambda format: {lambda_text}"
             raise ValueError(msg)
+
+        return lambda_text
+
+    def _parse_lambda_from_response(self, response_text: str) -> Callable[[Any], Any]:
+        """Extract and validate lambda function from LLM response."""
+        lambda_text = self._extract_lambda_text(response_text)
 
         # The lambda text is produced by an LLM from the user-controlled `filter_instruction`,
         # so it is untrusted: a prompt-injection can steer it to "lambda x: __import__('os')...".
@@ -252,6 +290,43 @@ class LambdaFilterComponent(Component):
             raise ValueError(msg) from exc
 
         return eval(lambda_text, {"__builtins__": safe_builtins()})  # noqa: S307
+
+    def _run_lambda_in_sandbox(self, lambda_text: str, data: Any) -> Any:
+        """Apply the LLM-authored lambda to ``data`` in the configured sandbox backend.
+
+        The VM boundary replaces the in-process mitigations: the AST
+        escape-gadget check and the curated builtins are host-process
+        protections and are intentionally skipped here, so the sandboxed lambda
+        may reach anything available in the guest image. Sandbox infrastructure
+        errors (including a configured-but-unavailable backend) propagate —
+        never fall back to in-process eval.
+
+        Input and result both cross the VM boundary as JSON, so this path only
+        supports JSON-serializable values. A tuple returns as a list, and sets
+        or custom objects are refused rather than silently coerced.
+        """
+        try:
+            data_json = json.dumps(data)
+        except TypeError as exc:
+            msg = f"Smart Transform cannot sandbox this input because it is not JSON-serializable: {exc}"
+            raise ValueError(msg) from exc
+
+        result = run_code_in_sandbox(
+            SANDBOX_LAMBDA_SCRIPT.format(data_literal=json.dumps(data_json), lambda_text=lambda_text),
+            session=session_for(self.flow_id, self.user_id, end_user_id_from_graph(getattr(self, "graph", None))),
+        )
+        if not result.success:
+            error_message = result.error_message()
+            self.log(f"Sandboxed lambda execution failed: {error_message}")
+            msg = f"Sandboxed lambda execution failed: {error_message}"
+            raise ValueError(msg)
+
+        self.log("Sandboxed lambda execution completed successfully")
+        try:
+            return json.loads(result.stdout.strip())
+        except json.JSONDecodeError as exc:
+            msg = f"Sandboxed lambda returned output that is not valid JSON: {result.stdout[:200]!r}"
+            raise ValueError(msg) from exc
 
     async def _execute_lambda(self) -> Any:
         """Generate and execute a lambda function based on input type."""
@@ -267,11 +342,22 @@ class LambdaFilterComponent(Component):
         self._token_usage = extract_usage_from_message(response)
         response_text = response.content if hasattr(response, "content") else str(response)
 
+        # Opt-in microVM isolation (LANGFLOW_SANDBOX_BACKEND, issue #12029):
+        # apply the untrusted lambda inside a VM instead of in-process eval.
+        if is_sandbox_enabled():
+            return self._run_lambda_in_sandbox(self._extract_lambda_text(response_text), data)
+
         fn = self._parse_lambda_from_response(response_text)
         return fn(data)
 
     def _handle_process_error(self, error: Exception, output_type: str) -> None:
         """Handle errors from process methods with context-aware messages."""
+        # A sandbox infrastructure failure is not an output-conversion problem.
+        # Surface it unchanged so the operator sees the real cause instead of a
+        # misleading "try a different output type" hint.
+        if isinstance(error, SandboxExecutionError):
+            raise error
+
         input_type = self._get_input_type_name()
         error_msg = (
             f"Failed to convert result to {output_type} output. "

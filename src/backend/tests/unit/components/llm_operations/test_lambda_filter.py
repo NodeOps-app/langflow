@@ -1,3 +1,5 @@
+import contextlib
+import io
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -5,6 +7,7 @@ from lfx.components.llm_operations.lambda_filter import LambdaFilterComponent
 from lfx.schema import Data
 from lfx.schema.dataframe import DataFrame
 from lfx.schema.message import Message
+from lfx.utils.sandbox import SandboxResult, SandboxUnavailableError
 
 from tests.base import ComponentTestBaseWithoutClient
 
@@ -51,6 +54,17 @@ class TestLambdaFilterComponent(ComponentTestBaseWithoutClient):
     @pytest.fixture
     def file_names_mapping(self):
         return []
+
+    @pytest.fixture(autouse=True)
+    def _sandbox_off_by_default(self):
+        """Pin the sandbox off so these tests assert the in-process path deterministically.
+
+        Without this a developer or CI runner that has LANGFLOW_SANDBOX_BACKEND
+        configured would route them into a real backend. Sandbox tests below opt
+        back in explicitly.
+        """
+        with patch("lfx.components.llm_operations.lambda_filter.is_sandbox_enabled", return_value=False):
+            yield
 
 
 class TestValidateLambda(TestLambdaFilterComponent):
@@ -770,3 +784,266 @@ class TestComplexDataStructure(TestLambdaFilterComponent):
         assert len(filtered_items) == 1
         assert filtered_items[0]["id"] == 3
         assert filtered_items[0]["score"] == 95
+
+
+def _run_guest_script(script: str) -> str:
+    """Execute a generated guest script the way the sandbox guest would, and return its stdout.
+
+    Running the real script, rather than asserting on its text, is what proves
+    the data embedding survives hostile input instead of becoming code.
+    """
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        exec(compile(script, "<guest>", "exec"), {})  # noqa: S102
+    return buffer.getvalue()
+
+
+def _guest_run(code, **_kwargs) -> SandboxResult:
+    """Stand in for run_code_in_sandbox by running the script locally."""
+    return SandboxResult(stdout=_run_guest_script(code), stderr="", exit_code=0)
+
+
+class TestSandboxedLambdaExecution(TestLambdaFilterComponent):
+    """The sandboxed path ships the lambda and its data into a VM instead of eval()ing in-process."""
+
+    def test_lambda_is_applied_to_data_inside_the_guest(self, component_class):
+        """Happy path: the generated script really transforms the data it carries."""
+        component = component_class()
+
+        with patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=_guest_run):
+            result = component._run_lambda_in_sandbox(
+                "lambda x: [i for i in x['items'] if i['value'] > 15]",
+                {"items": [{"name": "a", "value": 10}, {"name": "b", "value": 20}]},
+            )
+
+        assert result == [{"name": "b", "value": 20}]
+
+    def test_message_text_round_trips_through_the_guest(self, component_class):
+        """String input (the Message path) survives the JSON round trip."""
+        component = component_class()
+
+        with patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=_guest_run):
+            result = component._run_lambda_in_sandbox("lambda text: text.upper()", "hello world")
+
+        assert result == "HELLO WORLD"
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            '"""',
+            '") or __import__("os").system("id") or ("',
+            "\\",
+            "\\'\"",
+            "line one\nline two",
+            "'''\nimport os\nos.system('id')\n#",
+            "\u2028\u2029",
+            "\x00control",
+        ],
+    )
+    def test_hostile_data_is_carried_as_data_not_code(self, component_class, hostile):
+        """Data that looks like code must come back byte-identical, never execute."""
+        component = component_class()
+
+        with patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=_guest_run):
+            result = component._run_lambda_in_sandbox("lambda x: x['payload']", {"payload": hostile})
+
+        assert result == hostile
+
+    def test_incidental_guest_stdout_does_not_corrupt_the_result(self, component_class):
+        """`print` is a valid expression in a lambda; its output must not be parsed as the payload."""
+        component = component_class()
+
+        with patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=_guest_run):
+            result = component._run_lambda_in_sandbox("lambda x: print('noise') or 'clean'", {"a": 1})
+
+        assert result == "clean"
+
+    def test_non_serializable_input_is_refused_before_reaching_the_guest(self, component_class):
+        """A value the host cannot serialize fails with a clear message, not a mangled payload."""
+        component = component_class()
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox") as mock_run,
+            pytest.raises(ValueError, match="not JSON-serializable"),
+        ):
+            component._run_lambda_in_sandbox("lambda x: x", {"bad": {1, 2, 3}})
+
+        mock_run.assert_not_called()
+
+    def test_non_serializable_result_reports_a_clear_error(self, component_class):
+        """A lambda returning a set fails inside the guest with an explanatory message."""
+        component = component_class()
+
+        def failing_run(code, **_kwargs):
+            # Mirror the guest: the script raises, so the run exits non-zero with stderr.
+            try:
+                _run_guest_script(code)
+            except TypeError as exc:
+                return SandboxResult(stdout="", stderr=str(exc), exit_code=1)
+            msg = "expected the guest script to raise"
+            raise AssertionError(msg)
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=failing_run),
+            pytest.raises(ValueError, match="not JSON-serializable"),
+        ):
+            component._run_lambda_in_sandbox("lambda x: set(x)", [1, 2, 3])
+
+    def test_tuple_result_comes_back_as_a_list(self, component_class):
+        """Documented behaviour difference from the in-process path: JSON has no tuple."""
+        component = component_class()
+
+        with patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=_guest_run):
+            result = component._run_lambda_in_sandbox("lambda x: tuple(x)", [1, 2])
+
+        assert result == [1, 2]
+
+    def test_guest_failure_surfaces_the_error_message(self, component_class):
+        """A lambda that raises in the guest reports the guest's stderr."""
+        component = component_class()
+        failed = SandboxResult(stdout="", stderr="KeyError: 'missing'", exit_code=1)
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", return_value=failed),
+            pytest.raises(ValueError, match="KeyError"),
+        ):
+            component._run_lambda_in_sandbox("lambda x: x['missing']", {})
+
+    def test_non_json_guest_output_is_reported(self, component_class):
+        """Truncated or corrupted guest stdout must not surface as a silent None."""
+        component = component_class()
+        garbled = SandboxResult(stdout="{not json", stderr="", exit_code=0)
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", return_value=garbled),
+            pytest.raises(ValueError, match="not valid JSON"),
+        ):
+            component._run_lambda_in_sandbox("lambda x: x", {"a": 1})
+
+    def test_unavailable_backend_fails_closed(self, component_class):
+        """A configured-but-unusable backend propagates; it must never fall back to in-process eval."""
+        component = component_class()
+
+        with (
+            patch(
+                "lfx.components.llm_operations.lambda_filter.run_code_in_sandbox",
+                side_effect=SandboxUnavailableError("backend down"),
+            ),
+            pytest.raises(SandboxUnavailableError),
+        ):
+            component._run_lambda_in_sandbox("lambda x: x", {"a": 1})
+
+    def test_sandbox_error_is_not_disguised_as_a_conversion_failure(self, component_class):
+        """`_handle_process_error` must re-raise infrastructure errors unchanged."""
+        component = component_class()
+        component.data = Data(data={"a": 1})
+
+        with pytest.raises(SandboxUnavailableError, match="backend down"):
+            component._handle_process_error(SandboxUnavailableError("backend down"), "Data")
+
+
+class TestSandboxedProcessIntegration(TestLambdaFilterComponent):
+    """End-to-end through process_as_* with the sandbox backend switched on."""
+
+    @patch("lfx.base.models.unified_models.get_model_class")
+    async def test_process_as_data_routes_through_the_sandbox(
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
+    ):
+        mock_get_model_class.return_value = MagicMock(return_value=mock_llm)
+        component = await self.component_setup(component_class, default_kwargs)
+        mock_llm.ainvoke.return_value.content = "lambda x: [i for i in x['items'] if i['value'] > 15]"
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.is_sandbox_enabled", return_value=True),
+            patch(
+                "lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=_guest_run
+            ) as mock_run,
+        ):
+            result = await component.process_as_data()
+
+        mock_run.assert_called_once()
+        assert isinstance(result, Data)
+        assert result.data["_results"] == [{"name": "test2", "value": 20}]
+
+    @patch("lfx.base.models.unified_models.get_model_class")
+    async def test_process_as_message_routes_through_the_sandbox(
+        self, mock_get_model_class, component_class, model_metadata, mock_llm
+    ):
+        mock_get_model_class.return_value = MagicMock(return_value=mock_llm)
+        kwargs = {
+            "data": [Message(text="Hello World")],
+            "model": model_metadata,
+            "api_key": "test-api-key",
+            "filter_instruction": "Convert to uppercase",
+            "sample_size": 1000,
+            "max_size": 30000,
+        }
+        component = await self.component_setup(component_class, kwargs)
+        mock_llm.ainvoke.return_value.content = "lambda text: text.upper()"
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.is_sandbox_enabled", return_value=True),
+            patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox", side_effect=_guest_run),
+        ):
+            result = await component.process_as_message()
+
+        assert isinstance(result, Message)
+        assert result.text == "HELLO WORLD"
+
+    @patch("lfx.base.models.unified_models.get_model_class")
+    async def test_unavailable_backend_propagates_through_process_as_data(
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
+    ):
+        """Fail closed end to end: no fallback, and no misleading conversion error."""
+        mock_get_model_class.return_value = MagicMock(return_value=mock_llm)
+        component = await self.component_setup(component_class, default_kwargs)
+        mock_llm.ainvoke.return_value.content = "lambda x: x"
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.is_sandbox_enabled", return_value=True),
+            patch(
+                "lfx.components.llm_operations.lambda_filter.run_code_in_sandbox",
+                side_effect=SandboxUnavailableError("backend down"),
+            ),
+            pytest.raises(SandboxUnavailableError, match="backend down"),
+        ):
+            await component.process_as_data()
+
+    @patch("lfx.base.models.unified_models.get_model_class")
+    async def test_in_process_path_is_unchanged_when_sandbox_is_off(
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
+    ):
+        """With the backend off the component still eval()s in-process and never calls the sandbox."""
+        mock_get_model_class.return_value = MagicMock(return_value=mock_llm)
+        component = await self.component_setup(component_class, default_kwargs)
+        mock_llm.ainvoke.return_value.content = "lambda x: [i for i in x['items'] if i['value'] > 15]"
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.is_sandbox_enabled", return_value=False),
+            patch("lfx.components.llm_operations.lambda_filter.run_code_in_sandbox") as mock_run,
+        ):
+            result = await component.process_as_data()
+
+        mock_run.assert_not_called()
+        assert result.data["_results"] == [{"name": "test2", "value": 20}]
+
+    @patch("lfx.base.models.unified_models.get_model_class")
+    async def test_escape_gadget_reaches_the_guest_instead_of_being_rejected(
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
+    ):
+        """The AST check is a host protection; under the VM it is intentionally not applied."""
+        mock_get_model_class.return_value = MagicMock(return_value=mock_llm)
+        component = await self.component_setup(component_class, default_kwargs)
+        mock_llm.ainvoke.return_value.content = "lambda x: x.__class__.__name__"
+
+        with (
+            patch("lfx.components.llm_operations.lambda_filter.is_sandbox_enabled", return_value=True),
+            patch(
+                "lfx.components.llm_operations.lambda_filter.run_code_in_sandbox",
+                return_value=SandboxResult(stdout='"dict"', stderr="", exit_code=0),
+            ) as mock_run,
+        ):
+            result = await component.process_as_data()
+
+        mock_run.assert_called_once()
+        assert result.data == {"text": "dict"}
